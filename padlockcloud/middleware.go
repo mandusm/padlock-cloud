@@ -43,7 +43,7 @@ type Authenticate struct {
 }
 
 func (m *Authenticate) Wrap(h Handler) Handler {
-	return HandlerFunc(func(w http.ResponseWriter, r *http.Request, auth *AuthToken) error {
+	return HandlerFunc(func(w http.ResponseWriter, r *http.Request, _ *AuthToken) error {
 		// Get auth token from request
 		auth, err := m.Authenticate(r)
 
@@ -61,6 +61,22 @@ func (m *Authenticate) Wrap(h Handler) Handler {
 		// Make sure auth token has the right type
 		if m.Type != "" && m.Type != "universal" && auth.Type != m.Type {
 			return &InvalidAuthToken{auth.Email, auth.Token}
+		}
+
+		return h.Handle(w, r, auth)
+	})
+}
+
+// Middleware for locking state for a given account, if authenticated
+type LockAccount struct {
+	*Server
+}
+
+func (m *LockAccount) Wrap(h Handler) Handler {
+	return HandlerFunc(func(w http.ResponseWriter, r *http.Request, auth *AuthToken) error {
+		if t, _ := AuthTokenFromRequest(r); t != nil {
+			m.LockAccount(t.Email)
+			defer m.UnlockAccount(t.Email)
 		}
 
 		return h.Handle(w, r, auth)

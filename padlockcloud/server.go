@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -114,6 +115,7 @@ type Server struct {
 	emailRateLimiter  *EmailRateLimiter
 	cleanAuthRequests *Job
 	whitelist         *Whitelist
+	accountMutexes    map[string]*sync.Mutex
 }
 
 func (server *Server) BaseUrl(r *http.Request) string {
@@ -128,6 +130,36 @@ func (server *Server) BaseUrl(r *http.Request) string {
 		}
 		return fmt.Sprintf("%s://%s", scheme, r.Host)
 	}
+}
+
+func (server *Server) GetAccountMutex(email string) *sync.Mutex {
+	if server.accountMutexes[email] == nil {
+		server.accountMutexes[email] = &sync.Mutex{}
+	}
+
+	return server.accountMutexes[email]
+}
+
+func (server *Server) LockAccount(email string) {
+	server.GetAccountMutex(email).Lock()
+}
+
+func (server *Server) UnlockAccount(email string) {
+	server.GetAccountMutex(email).Unlock()
+}
+
+func (server *Server) DeleteAccount(email string) error {
+	acc := &Account{Email: email}
+
+	if err := server.Storage.Delete(&DataStore{Account: acc}); err != nil {
+		return err
+	}
+
+	if err := server.Storage.Delete(acc); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // Retreives Account object from a http.Request object by evaluating the Authorization header and
@@ -237,7 +269,7 @@ func (server *Server) HandleError(e error, w http.ResponseWriter, r *http.Reques
 func (server *Server) WrapEndpoint(endpoint *Endpoint) Handler {
 	var h Handler = endpoint
 
-	// If auth type is "web", wrap handler in csrf middleware
+	// If endpoint is authenticated, wrap handler in csrf middleware
 	if endpoint.AuthType != "" {
 		h = (&CSRF{server}).Wrap(h)
 	}
@@ -247,6 +279,9 @@ func (server *Server) WrapEndpoint(endpoint *Endpoint) Handler {
 
 	// Wrap handler in auth middleware
 	h = (&Authenticate{server, endpoint.AuthType}).Wrap(h)
+
+	// Wrap handler in auth middleware
+	h = (&LockAccount{server}).Wrap(h)
 
 	// Check if Method is supported
 	h = (&CheckMethod{endpoint.Handlers}).Wrap(h)
@@ -289,6 +324,14 @@ func (server *Server) InitEndpoints() {
 		},
 	}
 
+	// Endpoint for activating auth tokens (alias)
+	server.Endpoints["/a/"] = &Endpoint{
+		Handlers: map[string]Handler{
+			"GET":  &ActivateAuthToken{server},
+			"POST": &ActivateAuthToken{server},
+		},
+	}
+
 	// Endpoint for reading / writing and deleting a store
 	server.Endpoints["/store/"] = &Endpoint{
 		Handlers: map[string]Handler{
@@ -306,6 +349,13 @@ func (server *Server) InitEndpoints() {
 			"POST": &DeleteStore{server},
 		},
 		AuthType: "web",
+	}
+
+	server.Endpoints["/deleteaccount/"] = &Endpoint{
+		Handlers: map[string]Handler{
+			"POST": &DeleteAccount{server},
+		},
+		AuthType: "universal",
 	}
 
 	// Dashboard for managing data, auth tokens etc.
@@ -337,7 +387,7 @@ func (server *Server) InitEndpoints() {
 		Handlers: map[string]Handler{
 			"GET": &AccountInfo{server},
 		},
-		AuthType: "api",
+		AuthType: "universal",
 	}
 
 	server.Endpoints["/static/"] = &Endpoint{
@@ -512,6 +562,8 @@ func (server *Server) Init() error {
 		server.whitelist = whitelist
 		server.Log.Info.Printf("%d Whitelist emails set.\n", len(whitelist.Emails))
 	}
+
+	server.accountMutexes = make(map[string]*sync.Mutex)
 
 	return nil
 }
